@@ -45,3 +45,8 @@ x = \frac{arcsin(\sqrt{sin^2(\theta_p - \theta_0) + sin^2(\varphi_p - \varphi_0)
 y = \frac{arcsin(\sqrt{sin^2(\theta_p - \theta_0) + sin^2(\varphi_p - \varphi_0)})}{\sqrt{sin(\varphi_p - \varphi_0)^2 + sin(\theta_p - \theta_0)^2}} \cdot sin(\varphi_p - \varphi_0)
 \end{cases}
 $$
+
+特别的 当 $ \theta > 90^\circ $ 时 要将
+$$ arcsin(\sqrt{sin^2(\theta_p - \theta_0) + sin^2(\varphi_p - \varphi_0)}) $$
+的值替换为
+$$ 180^\circ - arcsin(\sqrt{sin^2(\theta_p - \theta_0) + sin^2(\varphi_p - \varphi_0)}) $$
