@@ -1,10 +1,9 @@
 use rayon::prelude::*;
 use shapefile::{Shape, ShapeReader};
 use std::io::Cursor;
-use std::iter::Zip;
 use std::mem::ManuallyDrop;
 use wide::CmpLt;
-use wide::{f64x4, f64x8};
+use wide::f64x8;
 
 const DEGREE_TO_RADIAN_CONSTANT: f64 = std::f64::consts::PI / 180_f64;
 const RADIAN_TO_DEGREE_CONSTANT: f64 = 180_f64 / std::f64::consts::PI;
@@ -77,8 +76,6 @@ pub fn latlon_to_azimnth_isometric_simd(
 
                 let latitude = f64x8::from(latitude_array);
                 let longitude = f64x8::from(longitude_array);
-
-                let posistion_array: [f64; 8] = longitude.abs().to_array();
 
                 let posistion = longitude.abs().simd_lt(f64x8::FRAC_PI_2);
 
