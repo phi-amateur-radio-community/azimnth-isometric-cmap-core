@@ -47,6 +47,7 @@ name = "amateur-radio-cmap-core"
 version = "0.1.0"
 dependencies = [
  "imageproc",
+ "rayon",
  "shapefile",
  "wide 1.0.2",
 ]
