@@ -199,6 +199,13 @@ impl ReturnContent {
             len: data.len(),
         }
     }
+
+    fn new_result(result: Result<Vec<u8>, shapefile::Error>) -> Self {
+        match result {
+            Ok(data) => Self::new(data, true),
+            Err(e) => Self::new(e.to_string().into_bytes(), false),
+        }
+    }
 }
 
 #[repr(C)]
@@ -214,24 +221,26 @@ pub struct GenerateParameters {
     pub fineness: u8,
 }
 
-// TODO
 #[unsafe(no_mangle)]
 pub fn shapefile_generate_csupport(
     buffer_ptr: *const u8,
     buffer_len: usize,
     parameter: GenerateParameters,
 ) -> ReturnContent {
-    shapefile_generate(
+    ReturnContent::new_result(shapefile_generate(
         unsafe { std::slice::from_raw_parts(buffer_ptr, buffer_len) },
         parameter,
-    )
+    ))
 }
 
-pub fn shapefile_generate(buffer: &[u8], parameter: GenerateParameters) -> ReturnContent {
+pub fn shapefile_generate(
+    buffer: &[u8],
+    parameter: GenerateParameters,
+) -> Result<Vec<u8>, shapefile::Error> {
     let cursor = Cursor::new(buffer);
     let mut reader = match ShapeReader::new(cursor) {
         Ok(data) => data,
-        Err(e) => return ReturnContent::new(e.to_string().into_bytes(), false),
+        Err(e) => return Err(e),
     };
     // TODO Draw the picture used par_iter
     //reader.for_each(|shape| )
