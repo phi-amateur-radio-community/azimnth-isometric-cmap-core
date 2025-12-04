@@ -126,49 +126,97 @@ pub fn latlon_to_azimnth_isometric_simd(
     longitude_delta_vec: Vec<f64>,
 ) -> (Vec<f64>, Vec<f64>) {
     let len = std::cmp::min(latitude_delta_vec.len(), longitude_delta_vec.len());
-    let latitude_delta_vec_chunks = latitude_delta_vec[..len].par_chunks_exact(8);
-    let longitude_delta_vec_chunks = longitude_delta_vec[..len].par_chunks_exact(8);
-    let chunks_remainder = latitude_delta_vec_chunks
-        .remainder()
-        .iter()
-        .copied()
-        .zip(longitude_delta_vec_chunks.remainder().iter().copied());
-    let chunks_bodys: Vec<([f64; 8], [f64; 8])> = latitude_delta_vec_chunks
+    let latitude_delta_vec_chunks = latitude_delta_vec[..len].par_chunks(4096);
+    let longitude_delta_vec_chunks = longitude_delta_vec[..len].par_chunks(4096);
+    let chunks_bodys: Vec<(Vec<f64>, Vec<f64>)> = latitude_delta_vec_chunks
         .zip(longitude_delta_vec_chunks)
         .map(
-            |(latitude_slice, longitude_slice): (&[f64], &[f64])| -> ([f64; 8], [f64; 8]) {
-                let latitude_array = latitude_slice;
-                let longitude_array = longitude_slice;
+            |(latitude_slice, longitude_slice): (&[f64], &[f64])| -> (Vec<f64>, Vec<f64>) {
+                let latitude_arraies = latitude_slice.chunks_exact(8);
+                let longitude_arraies = longitude_slice.chunks_exact(8);
+                let remainder = latitude_arraies
+                    .remainder()
+                    .iter()
+                    .copied()
+                    .zip(longitude_arraies.remainder().iter().copied());
 
-                let square = |x: f64x8| x * x;
+                let mut xs = Vec::<f64>::new();
+                let mut ys = Vec::<f64>::new();
 
-                let latitude = f64x8::from(latitude_array);
-                let longitude = f64x8::from(longitude_array);
+                for (latitude_array, longitude_array) in latitude_arraies.zip(longitude_arraies) {
+                    #[cfg(test)]
+                    let start = std::time::Instant::now();
 
-                let posistion = longitude.abs().simd_lt(f64x8::FRAC_PI_2);
+                    #[cfg(test)]
+                    dbg!(latitude_array, longitude_array);
 
-                let latitude_radian = latitude.to_radians();
-                let longitude_radian = longitude.to_radians();
+                    let square = |x: f64x8| x * x;
 
-                let latitude_radian_sine = latitude_radian.sin();
-                let longitude_radian_sine = longitude_radian.sin();
+                    let latitude = f64x8::from(latitude_array);
+                    let longitude = f64x8::from(longitude_array);
 
-                let distance =
-                    (square(latitude_radian_sine) + square(longitude_radian_sine)).sqrt();
+                    #[cfg(test)]
+                    dbg!(latitude, longitude);
 
-                let distance_arcsine = distance.asin().to_degrees();
-                let distance_arcsine_back = FRAC_PI_DEGREE - distance_arcsine;
+                    let posistion = longitude.abs().simd_lt(f64x8::FRAC_PI_2);
 
-                let k_uncheck = posistion.blend(distance_arcsine, distance_arcsine_back) / distance;
+                    #[cfg(test)]
+                    dbg!(posistion);
 
-                let k_infinite_mask = k_uncheck.is_inf();
-                let k_nan_mask = k_uncheck.is_nan();
+                    let latitude_radian = latitude.to_radians();
+                    let longitude_radian = longitude.to_radians();
 
-                let k_bad = k_infinite_mask | k_nan_mask;
+                    #[cfg(test)]
+                    dbg!(latitude_radian, longitude_radian);
 
-                let k = k_bad.blend(f64x8::ZERO, k_uncheck);
+                    let latitude_radian_sine = latitude_radian.sin();
+                    let longitude_radian_sine = longitude_radian.sin();
 
-                ((latitude * k).to_array(), (longitude * k).to_array())
+                    #[cfg(test)]
+                    dbg!(latitude_radian_sine, longitude_radian_sine);
+
+                    let distance =
+                        (square(latitude_radian_sine) + square(longitude_radian_sine)).sqrt();
+
+                    #[cfg(test)]
+                    dbg!(distance);
+
+                    let distance_arcsine = distance.asin().to_degrees();
+                    let distance_arcsine_back = FRAC_PI_DEGREE - distance_arcsine;
+
+                    #[cfg(test)]
+                    dbg!(distance_arcsine, distance_arcsine_back);
+
+                    let k_uncheck =
+                        posistion.blend(distance_arcsine, distance_arcsine_back) / distance;
+
+                    #[cfg(test)]
+                    dbg!(posistion.blend(distance_arcsine, distance_arcsine_back));
+
+                    let k_infinite_mask = k_uncheck.is_inf();
+                    let k_nan_mask = k_uncheck.is_nan();
+
+                    let k_bad = k_infinite_mask | k_nan_mask;
+
+                    let k = k_bad.blend(f64x8::ZERO, k_uncheck);
+
+                    #[cfg(test)]
+                    dbg!(k);
+
+                    xs.extend((longitude_radian_sine * k).to_array());
+                    ys.extend((latitude_radian_sine * k).to_array());
+
+                    #[cfg(test)]
+                    dbg!(start.elapsed());
+                }
+
+                for (latitude, longitude) in remainder {
+                    let (x, y) = latlon_to_azimnth_isometric(latitude, longitude);
+                    xs.push(x);
+                    ys.push(y);
+                }
+
+                (xs, ys)
             },
         )
         .collect();
@@ -179,12 +227,6 @@ pub fn latlon_to_azimnth_isometric_simd(
     for (x, y) in chunks_bodys {
         xs.extend(x);
         ys.extend(y);
-    }
-
-    for (latitude, longitude) in chunks_remainder {
-        let result = latlon_to_azimnth_isometric(latitude, longitude);
-        xs.push(result.0);
-        ys.push(result.1);
     }
 
     (xs, ys)
@@ -284,6 +326,16 @@ mod tests {
             self.results.push(result_a);
             self.results.push(result_b);
         }
+        fn add_tuple_2_vec(
+            &mut self,
+            (totals_a, totals_b): (Vec<T>, Vec<T>),
+            (results_a, results_b): (Vec<T>, Vec<T>),
+        ) {
+            self.totals.extend(totals_a);
+            self.totals.extend(totals_b);
+            self.results.extend(results_a);
+            self.results.extend(results_b);
+        }
         fn compare(&self) {
             assert_abs_diff_eq!(
                 self.totals.as_slice(),
@@ -302,24 +354,50 @@ mod tests {
 
         result.add_tuple_2(
             (0000_f64, 0000_f64),
-            latlon_to_azimnth_isometric(000_f64, 0000_f64),
+            latlon_to_azimnth_isometric(0000_f64, 0000_f64),
         );
         result.add_tuple_2(
             (0000_f64, -090_f64),
-            latlon_to_azimnth_isometric(-90_f64, 0000_f64),
+            latlon_to_azimnth_isometric(-090_f64, 0000_f64),
         );
         result.add_tuple_2(
             (0000_f64, 0135_f64),
-            latlon_to_azimnth_isometric(045_f64, 0180_f64),
+            latlon_to_azimnth_isometric(0045_f64, 0180_f64),
+        );
+        result.add_tuple_2(
+            (0000_f64, 0050_f64),
+            latlon_to_azimnth_isometric(0050_f64, 0000_f64),
         );
 
         let end_ltai = start.elapsed();
 
-        // TODO add test for ltais
-        //latlon_to_azimnth_isometric_simd()
+        result.add_tuple_2_vec(
+            (
+                vec![
+                    0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64,
+                    0000_f64, 0000_f64, 0000_f64, 0000_f64,
+                ],
+                vec![
+                    0020_f64, -020_f64, 0160_f64, -160_f64, 0050_f64, -050_f64, 0130_f64, -130_f64,
+                    0080_f64, -080_f64, 0100_f64, -100_f64,
+                ],
+            ),
+            latlon_to_azimnth_isometric_simd(
+                vec![
+                    0020_f64, -020_f64, 0020_f64, -020_f64, 0050_f64, -050_f64, 0050_f64, -050_f64,
+                    0080_f64, -080_f64, 0080_f64, -080_f64,
+                ],
+                vec![
+                    0000_f64, 0000_f64, 0180_f64, 0180_f64, 0000_f64, 0000_f64, 0180_f64, 0180_f64,
+                    0000_f64, 0000_f64, 0180_f64, 0180_f64,
+                ],
+            ),
+        );
+
+        let end_ltais = start.elapsed();
 
         result.compare();
 
-        println!("standard: {:?}\nltai: {:?}", standard, end_ltai);
+        dbg!(standard, end_ltai, end_ltais);
     }
 }
