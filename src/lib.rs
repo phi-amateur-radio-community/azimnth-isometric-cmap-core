@@ -3,8 +3,7 @@ use image::{ColorType, ImageEncoder};
 use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut, draw_polygon_mut};
 use imageproc::image::{Rgba, RgbaImage};
 use rayon::prelude::*;
-use shapefile::record::multipoint::GenericMultipoint;
-use shapefile::record::traits::HasXY;
+use shapefile::record::{multipoint::GenericMultipoint, polyline::GenericPolyline, traits::HasXY};
 use shapefile::{Shape, ShapeReader};
 use std::io::Cursor;
 use std::mem::ManuallyDrop;
@@ -295,7 +294,6 @@ pub fn shapefile_generate(
 }
 
 fn shapefile_draw(img: &mut RgbaImage, parameter: &GenerateParameters, shape: Shape, ltc: f64) {
-    //shapefile_draw_point(img, parameter.color_point, parameter.width_point, 1_f64, shapefile::record::Point::new(0_f64, 0_f64), parameter.radius as i32);
     match shape {
         Shape::NullShape => return,
         Shape::Point(point) => shapefile_draw_point(
@@ -324,27 +322,51 @@ fn shapefile_draw(img: &mut RgbaImage, parameter: &GenerateParameters, shape: Sh
         ),
         Shape::Multipoint(points) => shapefile_draw_multipoint(
             img,
-            parameter.color_point,
-            parameter.width_point,
+            parameter.color_multipoint,
+            parameter.width_multipoint,
             ltc,
             points,
             parameter.radius as i32,
         ),
         Shape::MultipointM(points) => shapefile_draw_multipoint(
             img,
-            parameter.color_point,
-            parameter.width_point,
+            parameter.color_multipoint,
+            parameter.width_multipoint,
             ltc,
             points,
             parameter.radius as i32,
         ),
         Shape::MultipointZ(points) => shapefile_draw_multipoint(
             img,
-            parameter.color_point,
-            parameter.width_point,
+            parameter.color_multipoint,
+            parameter.width_multipoint,
             ltc,
             points,
             parameter.radius as i32,
+        ),
+        Shape::Polyline(lines) => shapefile_draw_polyline(
+            img,
+            parameter.color_line,
+            parameter.width_line,
+            ltc,
+            lines,
+            parameter.radius as f32,
+        ),
+        Shape::PolylineM(lines) => shapefile_draw_polyline(
+            img,
+            parameter.color_line,
+            parameter.width_line,
+            ltc,
+            lines,
+            parameter.radius as f32,
+        ),
+        Shape::PolylineZ(lines) => shapefile_draw_polyline(
+            img,
+            parameter.color_line,
+            parameter.width_line,
+            ltc,
+            lines,
+            parameter.radius as f32,
         ),
         _ => return, // TODO
     }
@@ -366,7 +388,7 @@ fn shapefile_draw_point<T: HasXY>(
 
 fn shapefile_draw_multipoint<T: HasXY>(
     img: &mut RgbaImage,
-    color: u32,
+    color_data: u32,
     width: i32,
     ltc: f64,
     points: GenericMultipoint<T>,
@@ -374,7 +396,8 @@ fn shapefile_draw_multipoint<T: HasXY>(
 ) {
     let mut latitudes = Vec::<f64>::new();
     let mut longitudes = Vec::<f64>::new();
-    points.into_inner().iter().for_each(|point| {
+    let color = get_color_rgba(color_data);
+    points.points().iter().for_each(|point| {
         latitudes.push(point.y());
         longitudes.push(point.x());
     });
@@ -382,7 +405,42 @@ fn shapefile_draw_multipoint<T: HasXY>(
     for (x_origin, y_origin) in xs.iter().copied().zip(ys.iter().copied()) {
         let x = (x_origin * ltc).round() as i32 + r;
         let y = (y_origin * ltc).round() as i32 + r;
-        draw_filled_circle_mut(img, (x, y), width, get_color_rgba(color));
+        draw_filled_circle_mut(img, (x, y), width, color);
+    }
+}
+
+fn shapefile_draw_polyline<T: HasXY>(
+    img: &mut RgbaImage,
+    color_data: u32,
+    width: i32,
+    ltc: f64,
+    lines: GenericPolyline<T>,
+    r: f32,
+) {
+    let color = get_color_rgba(color_data);
+    for part in lines.parts() {
+        let mut latitudes = Vec::<f64>::new();
+        let mut longitudes = Vec::<f64>::new();
+        part.iter().for_each(|point| {
+            latitudes.push(point.y());
+            longitudes.push(point.x());
+        });
+        let (xs, ys) = latlon_to_azimnth_isometric_simd(latitudes, longitudes);
+        let mut positions = xs.iter().copied().zip(ys.iter().copied());
+        let (x_first, y_first) = match positions.next() {
+            Some((x, y)) => ((x * ltc).round() as f32 + r, (y * ltc).round() as f32 + r),
+            None => return,
+        };
+        let mut x_cache = x_first;
+        let mut y_cache = y_first;
+        for (x_origin, y_origin) in positions {
+            let x = (x_origin * ltc).round() as f32 + r;
+            let y = (y_origin * ltc).round() as f32 + r;
+            draw_line_segment_mut(img, (x_cache, y_cache), (x, y), color);
+            x_cache = x;
+            y_cache = y;
+        }
+        draw_line_segment_mut(img, (x_cache, y_cache), (x_first, y_first), color);
     }
 }
 
