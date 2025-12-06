@@ -317,7 +317,32 @@ pub fn shapefile_generate(
     #[cfg(test)]
     println!("1");
 
-    //let shape_latlon = d
+    let mut shape_vec_latlon = Vec::<Vec<shapefile::Point>>::new();
+    for x in -17..18 {
+        let mut shape_vec_cache = Vec::<shapefile::Point>::new();
+        for y in -899..900 {
+            shape_vec_cache.push(shapefile::Point::new((x * 10) as f64, y as f64 / 10_f64));
+        }
+        shape_vec_cache.push(shapefile::Point::new((x * 10) as f64, -89.9_f64));
+        shape_vec_latlon.push(shape_vec_cache);
+    }
+    for y in -8..9 {
+        let mut shape_vec_cache = Vec::<shapefile::Point>::new();
+        for x in -1799..1800 {
+            shape_vec_cache.push(shapefile::Point::new(x as f64 / 10_f64, (y * 10) as f64));
+        }
+        shape_vec_cache.push(shapefile::Point::new(-179.9_f64, (y * 10) as f64));
+        shape_vec_latlon.push(shape_vec_cache);
+    }
+    shapefile_draw(
+        &mut img,
+        &mut img_all,
+        &parameter,
+        shapefile::Shape::Polyline(shapefile::record::polyline::Polyline::with_parts(
+            shape_vec_latlon,
+        )),
+        linear_transformation_constant,
+    );
 
     for shape in reader.iter_shapes() {
         shapefile_draw(
@@ -503,12 +528,10 @@ fn shapefile_draw_polyline<T: HasXY>(
         });
         let (xs, ys) = latlon_to_azimnth_isometric_simd(latitudes, longitudes);
         let mut positions = xs.iter().copied().zip(ys.iter().copied());
-        let (x_first, y_first) = match positions.next() {
+        let (mut x_cache, mut y_cache) = match positions.next() {
             Some((x, y)) => ((x * ltc).round() as f32 + r, (y * ltc).round() as f32 + r),
             None => return,
         };
-        let mut x_cache = x_first;
-        let mut y_cache = y_first;
         for (x_origin, y_origin) in positions {
             let x = (x_origin * ltc).round() as f32 + r;
             let y = (y_origin * ltc).round() as f32 + r;
@@ -516,7 +539,6 @@ fn shapefile_draw_polyline<T: HasXY>(
             x_cache = x;
             y_cache = y;
         }
-        draw_line_segment_mut(img, (x_cache, y_cache), (x_first, y_first), color);
     }
 }
 
@@ -772,12 +794,12 @@ mod tests {
             color_point: 0x0000FFu32,
             color_multipoint: 0x0000FFu32,
             color_line: 0xFFFFFFFFu32,
-            color_polygon: 0xF2EC2FFu32,
+            color_polygon: 0xF2E6C2FFu32,
             width_point: 3_i32,
             width_multipoint: 3_i32,
             width_line: 2_i32,
             fineness: 0x00u8,
-            radius: 500u32,
+            radius: 2000u32,
         };
 
         let mut out_file = File::create("./out/image.png").unwrap();
