@@ -1,6 +1,5 @@
 use image::codecs::png::PngEncoder;
 use std::collections::HashSet;
-
 use image::GenericImage;
 use image::{ColorType, ImageEncoder};
 use imageproc::drawing::{
@@ -16,12 +15,10 @@ use shapefile::record::{
 use shapefile::{Shape, ShapeReader};
 use std::io::Cursor;
 use std::mem::ManuallyDrop;
-use wide::CmpLt;
-use wide::f64x8;
 
 const DEGREE_TO_RADIAN_CONSTANT: f64 = std::f64::consts::PI / 180_f64;
 const RADIAN_TO_DEGREE_CONSTANT: f64 = 180_f64 / std::f64::consts::PI;
-const FRAC_PI_DEGREE: f64x8 = f64x8::new([180f64; 8]);
+const PI: f64 = std::f64::consts::PI;
 
 #[warn(no_mangle_generic_items)]
 pub extern "C" fn free<T>(ptr: *const T, len: usize) {
@@ -38,190 +35,73 @@ pub struct LatlonToAzimnthIsometricCsupport {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn latlon_to_azimnth_isometric_csupport(
-    latitude_delta: f64,
-    longitude_delta: f64,
+    lat: f64,
+    lat_base: f64,
+    lon_delta: f64,
 ) -> LatlonToAzimnthIsometricCsupport {
-    let (x, y): (f64, f64) = latlon_to_azimnth_isometric(latitude_delta, longitude_delta);
+    let (x, y): (f64, f64) = latlon_to_azimnth_isometric(lat, lon_delta, lat_base);
     LatlonToAzimnthIsometricCsupport { x, y }
 }
 
-pub fn latlon_to_azimnth_isometric(latitude_delta: f64, longitude_delta: f64) -> (f64, f64) {
+pub fn latlon_to_azimnth_isometric(lat: f64, lon_delta: f64, lat_base: f64) -> (f64, f64) {
     let square = |x: f64| x * x;
-    let degree_to_radian = |degree: f64| degree * DEGREE_TO_RADIAN_CONSTANT;
-    let radian_to_degree = |radian: f64| radian * RADIAN_TO_DEGREE_CONSTANT;
-    let latitude_delta_radian: f64 = degree_to_radian(latitude_delta);
-    let longitude_delta_radian: f64 = degree_to_radian(longitude_delta);
-    let hemispheres_anterior_or_posterior: bool = longitude_delta.abs() < 90_f64;
-    let (latitude_delta_radian_sine, latitude_delta_radian_cosine): (f64, f64) =
-        latitude_delta_radian.sin_cos();
-    let longitude_delta_radian_sine: f64 = longitude_delta_radian.sin();
-    let distance: f64 = (square(latitude_delta_radian_sine)
-        + square(longitude_delta_radian_sine * latitude_delta_radian_cosine))
-    .sqrt();
-    let k: f64 = match distance {
-        0_f64 => 0_f64,
-        _ => {
-            (if hemispheres_anterior_or_posterior {
-                radian_to_degree(distance.asin())
-            } else {
-                180_f64 - radian_to_degree(distance.asin())
-            }) / distance
-        }
-    };
-    (
-        longitude_delta_radian_sine * latitude_delta_radian_cosine * k,
-        latitude_delta_radian_sine * k,
-    )
+    let square_overflow = |x: f64| square(x).clamp(-1f64,1f64);
+    let lat_rad = lat * DEGREE_TO_RADIAN_CONSTANT;
+    let lon_delta_rad = lon_delta * DEGREE_TO_RADIAN_CONSTANT;
+    let (lat_sin, lat_cos) = lat_rad.sin_cos();
+    let (lon_delta_sin, lon_delta_cos) = lon_delta_rad.sin_cos();
+    let p_x = lat_cos * lon_delta_cos;
+    let p_y = lat_sin;
+    let p_angle = p_y.atan2(p_x);
+    let p_distance = (square(p_x) + square(p_y)).sqrt();
+    let angle_delta = p_angle - lat_base*DEGREE_TO_RADIAN_CONSTANT;
+    let (angle_delta_sin, angle_delta_cos) = angle_delta.sin_cos();
+    let x = angle_delta_cos * p_distance;
+    if x.abs() == 1f64 {
+        return (0f64, 0f64);
+    }
+    let y = angle_delta_sin * p_distance;
+    let distance = x.acos();
+    let angle_cos = y / (1f64 - square(x)).sqrt();
+    let angle_sin = if lon_delta_sin > 0f64 {(1f64 - square_overflow(angle_cos)).sqrt()} else {- (1f64 - square_overflow(angle_cos)).sqrt()};
+
+    println!("x:{}, y:{}, lat:{}, lon:{}, p_x:{}, p_y:{}, p_angle:{}, p_distance:{}, distance:{}, angle_sin:{}, angle_cos:{}", angle_sin * distance * 200f64 / PI, angle_cos * distance * 200f64 / PI, lat, lon_delta, p_x, p_y, p_angle, p_distance, distance, angle_sin, angle_cos);
+    
+    (angle_sin * distance, -angle_cos * distance)
 }
 
-#[repr(C)]
-pub struct LatlonToAzimnthIsometricSimdCsupport {
-    pub a_ptr: *const f64,
-    pub a_len: usize,
-    pub b_ptr: *const f64,
-    pub b_len: usize,
+#[derive(Copy, Clone)]
+struct Point {
+    pub x: f64,
+    pub y: f64,
 }
 
-impl LatlonToAzimnthIsometricSimdCsupport {
-    pub fn new((a, b): (Vec<f64>, Vec<f64>)) -> Self {
-        let mut result: LatlonToAzimnthIsometricSimdCsupport =
-            LatlonToAzimnthIsometricSimdCsupport {
-                a_ptr: std::ptr::null(),
-                a_len: 0usize,
-                b_ptr: std::ptr::null(),
-                b_len: 0usize,
-            };
-        result.set_a(a);
-        result.set_b(b);
-        result
-    }
-
-    pub fn get(&self) -> (Vec<f64>, Vec<f64>) {
-        (self.get_a(), self.get_b())
-    }
-
-    pub fn get_a(&self) -> Vec<f64> {
-        unsafe {
-            let slice = std::slice::from_raw_parts(self.a_ptr, self.a_len);
-            slice.to_vec()
+impl Point {
+    pub fn new<T: HasXY>(p: &T) -> Self {
+        Point {
+            x: p.x(),
+            y: p.y(),
         }
     }
-
-    pub fn set_a(&mut self, data: Vec<f64>) {
-        let data_memory = ManuallyDrop::new(data.into_boxed_slice());
-        self.a_ptr = data_memory.as_ptr();
-        self.a_len = data_memory.len();
-    }
-
-    pub fn get_b(&self) -> Vec<f64> {
-        unsafe {
-            let slice = std::slice::from_raw_parts(self.b_ptr, self.b_len);
-            slice.to_vec()
-        }
-    }
-
-    pub fn set_b(&mut self, data: Vec<f64>) {
-        let data_memory = ManuallyDrop::new(data.into_boxed_slice());
-        self.b_ptr = data_memory.as_ptr();
-        self.b_len = data_memory.len();
-    }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn latlon_to_azimnth_isometric_simd_csupport(
-    parameter: LatlonToAzimnthIsometricSimdCsupport,
-) -> LatlonToAzimnthIsometricSimdCsupport {
-    LatlonToAzimnthIsometricSimdCsupport::new(latlon_to_azimnth_isometric_simd(
-        parameter.get_a(),
-        parameter.get_b(),
-    ))
-}
-
-pub fn latlon_to_azimnth_isometric_simd(
-    latitude_delta_vec: Vec<f64>,
-    longitude_delta_vec: Vec<f64>,
-) -> (Vec<f64>, Vec<f64>) {
-    let len = std::cmp::min(latitude_delta_vec.len(), longitude_delta_vec.len());
-    let latitude_delta_vec_chunks = latitude_delta_vec[..len].par_chunks_exact(4096);
-    let longitude_delta_vec_chunks = longitude_delta_vec[..len].par_chunks_exact(4096);
-    let chunks_remainder = latitude_delta_vec_chunks
-        .remainder()
-        .iter()
-        .copied()
-        .zip(longitude_delta_vec_chunks.remainder().iter().copied());
-    let chunks_bodys: Vec<([f64; 4096], [f64; 4096])> = latitude_delta_vec_chunks
-        .zip(longitude_delta_vec_chunks)
-        .map(
-            |(latitude_slice, longitude_slice): (&[f64], &[f64])| -> ([f64; 4096], [f64; 4096]) {
-                let mut latitude_arraies = latitude_slice.chunks_exact(8);
-                let mut longitude_arraies = longitude_slice.chunks_exact(8);
-
-                let mut xs: [f64; 4096] = [0_f64; 4096];
-                let mut ys: [f64; 4096] = [0_f64; 4096];
-
-                for (x, y) in xs.chunks_mut(8).zip(ys.chunks_mut(8)) {
-                    let latitude_array = match latitude_arraies.next() {
-                        Some(s) => s,
-                        None => return (xs, ys),
-                    };
-                    let longitude_array = match longitude_arraies.next() {
-                        Some(s) => s,
-                        None => return (xs, ys),
-                    };
-                    let square = |x: f64x8| x * x;
-
-                    let latitude = f64x8::from(latitude_array);
-                    let longitude = f64x8::from(longitude_array);
-
-                    let posistion = longitude.abs().simd_lt(f64x8::FRAC_PI_2);
-
-                    let latitude_radian = latitude.to_radians();
-                    let longitude_radian = longitude.to_radians();
-
-                    let (latitude_radian_sine, latitude_radian_cosine) = latitude_radian.sin_cos();
-                    let longitude_radian_sine = longitude_radian.sin();
-
-                    let distance = (square(latitude_radian_sine)
-                        + square(longitude_radian_sine * latitude_radian_cosine))
-                    .sqrt();
-
-                    let distance_arcsine = distance.asin().to_degrees();
-                    let distance_arcsine_back = FRAC_PI_DEGREE - distance_arcsine;
-
-                    let k_uncheck =
-                        posistion.blend(distance_arcsine, distance_arcsine_back) / distance;
-
-                    let k_infinite_mask = k_uncheck.is_inf();
-                    let k_nan_mask = k_uncheck.is_nan();
-
-                    let k_bad = k_infinite_mask | k_nan_mask;
-
-                    let k = k_bad.blend(f64x8::ZERO, k_uncheck);
-
-                    x.copy_from_slice((longitude_radian_sine * k).as_array());
-                    y.copy_from_slice((latitude_radian_sine * k).as_array());
-                }
-
-                (xs, ys)
-            },
+const CHUNKS_SIZE: usize = 4096;
+fn latlon_to_azimnth_isometric_array(points: Vec<Point>, lat_base: f64, lon_base: f64) -> (Vec<f64>, Vec<f64>) {
+    let points_len = points.len();
+    points.par_chunks(CHUNKS_SIZE)
+        .map(|chunk| {
+            chunk.iter().map(|point| {
+                latlon_to_azimnth_isometric(point.y, point.x - lon_base, lat_base)
+            }).unzip()
+        })
+        .reduce( 
+            || (Vec::with_capacity(points_len), Vec::with_capacity(points_len)),
+            |(mut xs1, mut ys1), (xs2, ys2)| {
+                xs1.extend(xs2);
+                ys1.extend(ys2);
+                (xs1, ys1)
+            }
         )
-        .collect();
-
-    let mut xs: Vec<f64> = Vec::with_capacity(len);
-    let mut ys: Vec<f64> = Vec::with_capacity(len);
-
-    for (x, y) in chunks_bodys {
-        xs.extend(x);
-        ys.extend(y);
-    }
-
-    for (latitude, longitude) in chunks_remainder {
-        let result = latlon_to_azimnth_isometric(latitude, longitude);
-        xs.push(result.0);
-        ys.push(result.1);
-    }
-
-    (xs, ys)
 }
 
 #[repr(C)]
@@ -261,39 +141,63 @@ pub struct GenerateParameters {
     // TODO add jump point
     pub fineness: u8,
     pub radius: u32,
-    pub base_latitude: f64,
-    pub base_longitude: f64,
+    pub base_lat: f64,
+    pub base_lon: f64,
 }
 
 #[unsafe(no_mangle)]
 pub fn shapefile_generate_csupport(
     buffer_ptr: *const u8,
     buffer_len: usize,
-    parameter: GenerateParameters,
+    para: GenerateParameters,
 ) -> ReturnContent {
     ReturnContent::new_result(shapefile_generate(
         unsafe { std::slice::from_raw_parts(buffer_ptr, buffer_len) },
-        parameter,
+        para,
     ))
 }
 
 pub fn shapefile_generate(
     buffer: &[u8],
-    parameter: GenerateParameters,
+    para: GenerateParameters,
 ) -> Result<Vec<u8>, shapefile::Error> {
     let cursor = Cursor::new(buffer);
     let mut reader = match ShapeReader::new(cursor) {
         Ok(data) => data,
         Err(e) => return Err(e),
     };
-    let size = (parameter.radius * 2) + 1;
+    let size = (para.radius * 2) + 1;
     let mut img: RgbaImage = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 0]));
-    let linear_transformation_constant = parameter.radius as f64 / 180_f64;
+    let linear_transformation_constant = para.radius as f64 / PI;
     let mut img_all = GrayImage::new(size, size);
-    let radius = parameter.radius as i32;
+    let radius = para.radius as i32;
+    draw_filled_circle_mut(&mut img_all, (radius, radius), radius, image::Luma([255]));
+    for shape in reader.iter_shapes() {
+        shapefile_draw(
+            &mut img,
+            &mut img_all,
+            &para,
+            shape?,
+            linear_transformation_constant,
+        );
+    }
+    let mut result = Vec::new();
+    let encoder = PngEncoder::new(&mut result);
+    encoder
+        .write_image(&img, size, size, ColorType::Rgba8.into())
+        .unwrap();
+    Ok(result)
+}
+
+pub fn latlon_line_draw (para: GenerateParameters, spacing: usize, fineness: usize) -> Vec<u8> {
+    let size = (para.radius * 2) + 1;
+    let mut img: RgbaImage = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 0]));
+    let linear_transformation_constant = para.radius as f64 / PI;
+    let mut img_all = GrayImage::new(size, size);
+    let radius = para.radius as i32;
     draw_filled_circle_mut(&mut img_all, (radius, radius), radius, image::Luma([255]));
     let mut shape_vec_latlon = Vec::<Vec<shapefile::Point>>::new();
-    for x in -17..18 {
+    for x in -17..19 {
         let mut shape_vec_cache = Vec::<shapefile::Point>::new();
         for y in -899..900 {
             shape_vec_cache.push(shapefile::Point::new((x * 10) as f64, y as f64 / 10_f64));
@@ -312,34 +216,24 @@ pub fn shapefile_generate(
     shapefile_draw(
         &mut img,
         &mut img_all,
-        &parameter,
+        &para,
         shapefile::Shape::Polyline(shapefile::record::polyline::Polyline::with_parts(
             shape_vec_latlon,
         )),
         linear_transformation_constant,
     );
-
-    for shape in reader.iter_shapes() {
-        shapefile_draw(
-            &mut img,
-            &mut img_all,
-            &parameter,
-            shape?,
-            linear_transformation_constant,
-        );
-    }
     let mut result = Vec::new();
     let encoder = PngEncoder::new(&mut result);
     encoder
         .write_image(&img, size, size, ColorType::Rgba8.into())
         .unwrap();
-    Ok(result)
+    result
 }
 
 fn shapefile_draw(
     img: &mut RgbaImage,
     img_all: &mut GrayImage,
-    parameter: &GenerateParameters,
+    para: &GenerateParameters,
     shape: Shape,
     ltc: f64,
 ) {
@@ -347,99 +241,123 @@ fn shapefile_draw(
         Shape::NullShape => return,
         Shape::Point(point) => shapefile_draw_point(
             img,
-            parameter.color_point,
-            parameter.width_point,
+            para.color_point,
+            para.width_point,
+            para.base_lat,
+            para.base_lon,
             ltc,
             point,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::PointM(point) => shapefile_draw_point(
             img,
-            parameter.color_point,
-            parameter.width_point,
+            para.color_point,
+            para.width_point,
+            para.base_lat,
+            para.base_lon,
             ltc,
             point,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::PointZ(point) => shapefile_draw_point(
             img,
-            parameter.color_point,
-            parameter.width_point,
+            para.color_point,
+            para.width_point,
+            para.base_lat,
+            para.base_lon,
             ltc,
             point,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::Multipoint(points) => shapefile_draw_multipoint(
             img,
-            parameter.color_multipoint,
-            parameter.width_multipoint,
+            para.color_multipoint,
+            para.width_multipoint,
+            para.base_lat,
+            para.base_lon,
             ltc,
             points,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::MultipointM(points) => shapefile_draw_multipoint(
             img,
-            parameter.color_multipoint,
-            parameter.width_multipoint,
+            para.color_multipoint,
+            para.width_multipoint,
+            para.base_lat,
+            para.base_lon,
             ltc,
             points,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::MultipointZ(points) => shapefile_draw_multipoint(
             img,
-            parameter.color_multipoint,
-            parameter.width_multipoint,
+            para.color_multipoint,
+            para.width_multipoint,
+            para.base_lat,
+            para.base_lon,
             ltc,
             points,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::Polyline(lines) => shapefile_draw_polyline(
             img,
-            parameter.color_line,
-            parameter.width_line,
+            para.color_line,
+            para.width_line,
+            para.base_lat,
+            para.base_lon,
             ltc,
             lines,
-            parameter.radius as f32,
+            para.radius as f32,
         ),
         Shape::PolylineM(lines) => shapefile_draw_polyline(
             img,
-            parameter.color_line,
-            parameter.width_line,
+            para.color_line,
+            para.width_line,
+            para.base_lat,
+            para.base_lon,
             ltc,
             lines,
-            parameter.radius as f32,
+            para.radius as f32,
         ),
         Shape::PolylineZ(lines) => shapefile_draw_polyline(
             img,
-            parameter.color_line,
-            parameter.width_line,
+            para.color_line,
+            para.width_line,
+            para.base_lat,
+            para.base_lon,
             ltc,
             lines,
-            parameter.radius as f32,
+            para.radius as f32,
         ),
         Shape::Polygon(rings) => shapefile_draw_polygon(
             img,
             img_all,
-            parameter.color_polygon,
+            para.color_polygon,
+            para.base_lat,
+            para.base_lon,
             ltc,
             rings,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::PolygonM(rings) => shapefile_draw_polygon(
             img,
             img_all,
-            parameter.color_polygon,
+            para.color_polygon,
+            para.base_lat,
+            para.base_lon,
             ltc,
             rings,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         Shape::PolygonZ(rings) => shapefile_draw_polygon(
             img,
             img_all,
-            parameter.color_polygon,
+            para.color_polygon,
+            para.base_lat,
+            para.base_lon,
             ltc,
             rings,
-            parameter.radius as i32,
+            para.radius as i32,
         ),
         _ => return ,
     }
@@ -449,11 +367,13 @@ fn shapefile_draw_point<T: HasXY>(
     img: &mut RgbaImage,
     color: u32,
     width: i32,
+    base_lat: f64,
+    base_lon: f64,
     ltc: f64,
     point: T,
     r: i32,
 ) {
-    let (x, y) = latlon_to_azimnth_isometric(point.y(), point.x());
+    let (x, y) = latlon_to_azimnth_isometric(point.y(), point.x() - base_lon, base_lat);
     let x = (x * ltc).round() as i32 + r;
     let y = (y * ltc).round() as i32 + r;
     draw_filled_circle_mut(img, (x, y), width, get_color_rgba(color));
@@ -463,18 +383,14 @@ fn shapefile_draw_multipoint<T: HasXY>(
     img: &mut RgbaImage,
     color_data: u32,
     width: i32,
+    base_lat: f64,
+    base_lon: f64,
     ltc: f64,
     points: GenericMultipoint<T>,
     r: i32,
 ) {
-    let mut latitudes = Vec::<f64>::new();
-    let mut longitudes = Vec::<f64>::new();
     let color = get_color_rgba(color_data);
-    points.points().iter().for_each(|point| {
-        latitudes.push(point.y());
-        longitudes.push(point.x());
-    });
-    let (xs, ys) = latlon_to_azimnth_isometric_simd(latitudes, longitudes);
+    let (xs, ys) = latlon_to_azimnth_isometric_array(points.points().into_iter().map(Point::new).collect(), base_lat, base_lon);
     for (x_origin, y_origin) in xs.iter().copied().zip(ys.iter().copied()) {
         let x = (x_origin * ltc).round() as i32 + r;
         let y = (y_origin * ltc).round() as i32 + r;
@@ -486,19 +402,15 @@ fn shapefile_draw_polyline<T: HasXY>(
     img: &mut RgbaImage,
     color_data: u32,
     width: i32,
+    base_lat: f64,
+    base_lon: f64,
     ltc: f64,
     lines: GenericPolyline<T>,
     r: f32,
 ) {
     let color = get_color_rgba(color_data);
     for part in lines.parts() {
-        let mut latitudes = Vec::<f64>::new();
-        let mut longitudes = Vec::<f64>::new();
-        part.iter().for_each(|point| {
-            latitudes.push(point.y());
-            longitudes.push(point.x());
-        });
-        let (xs, ys) = latlon_to_azimnth_isometric_simd(latitudes, longitudes);
+        let (xs, ys) = latlon_to_azimnth_isometric_array(part.into_iter().map(Point::new).collect(), base_lat, base_lon);
         let mut positions = xs.iter().copied().zip(ys.iter().copied());
         let (mut x_cache, mut y_cache) = match positions.next() {
             Some((x, y)) => ((x * ltc).round() as f32 + r, (y * ltc).round() as f32 + r),
@@ -518,6 +430,8 @@ fn shapefile_draw_polygon<T: HasXY>(
     img: &mut RgbaImage,
     img_all: &GrayImage,
     color_data: u32,
+    base_lat: f64,
+    base_lon: f64,
     ltc: f64,
     polygon: GenericPolygon<T>,
     r: i32,
@@ -527,13 +441,7 @@ fn shapefile_draw_polygon<T: HasXY>(
     let mut img_out: GrayImage = GrayImage::new(size, size);
     let mut img_in: GrayImage = GrayImage::new(size, size);
     for ring in polygon.rings() {
-        let mut latitudes = Vec::<f64>::new();
-        let mut longitudes = Vec::<f64>::new();
-        ring.points().iter().for_each(|point| {
-            latitudes.push(point.y());
-            longitudes.push(point.x());
-        });
-        let (xs, ys) = latlon_to_azimnth_isometric_simd(latitudes, longitudes);
+        let (xs, ys) = latlon_to_azimnth_isometric_array(ring.points().into_iter().map(Point::new).collect(), base_lat, base_lon);
         let is_cw = is_clockwise(&xs, &ys);
         let mut point_set = HashSet::<(i32, i32)>::new();
         let points: Vec<imageproc::point::Point<i32>> = xs
@@ -557,12 +465,15 @@ fn shapefile_draw_polygon<T: HasXY>(
                 None => imageproc::point::Point::new(0i32, 0i32),
             })
             .collect();
+        if points.len() < 3 {
+            return;
+        }
         let luma = image::Luma([255u8]);
         match (ring, is_cw) {
-            (Outer(_), true) => draw_polygon_mut(&mut img_out, &points, luma),
-            (Outer(_), false) => draw_merge(&draw_polygon(img_all, &points, luma), &mut img_out),
-            (Inner(_), true) => draw_merge(&draw_polygon(img_all, &points, luma), &mut img_in),
-            (Inner(_), false) => draw_polygon_mut(&mut img_in, &points, luma),
+            (Outer(_), false) => draw_polygon_mut(&mut img_out, &points, luma),
+            (Outer(_), true) => draw_merge(&draw_polygon(img_all, &points, image::Luma([0u8])), &mut img_out),
+            (Inner(_), false) => draw_merge(&draw_polygon(img_all, &points, image::Luma([0u8])), &mut img_in),
+            (Inner(_), true) => draw_polygon_mut(&mut img_in, &points, luma),
         }
         draw_with_mask_gray(&img_out, &img_in, img, color);
     }
@@ -632,112 +543,13 @@ fn get_color_rgba(color: u32) -> Rgba<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::AbsDiffEq;
-    use approx::assert_abs_diff_eq;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::time::Instant;
-
-    struct ResultBody<T: AbsDiffEq> {
-        totals: Vec<T>,
-        results: Vec<T>,
-        epsilon: f64,
-    }
-
-    impl<T: AbsDiffEq<Epsilon = f64> + std::fmt::Debug> ResultBody<T> {
-        fn new(epsilon: f64) -> Self {
-            ResultBody {
-                totals: Vec::new(),
-                results: Vec::new(),
-                epsilon,
-            }
-        }
-        fn add_tuple_2(&mut self, (total_a, total_b): (T, T), (result_a, result_b): (T, T)) {
-            self.totals.push(total_a);
-            self.totals.push(total_b);
-            self.results.push(result_a);
-            self.results.push(result_b);
-        }
-        fn add_tuple_2_vec(
-            &mut self,
-            (totals_a, totals_b): (Vec<T>, Vec<T>),
-            (results_a, results_b): (Vec<T>, Vec<T>),
-        ) {
-            self.totals.extend(totals_a);
-            self.totals.extend(totals_b);
-            self.results.extend(results_a);
-            self.results.extend(results_b);
-        }
-        fn compare(&self) {
-            assert_abs_diff_eq!(
-                self.totals.as_slice(),
-                self.results.as_slice(),
-                epsilon = self.epsilon
-            );
-            println!("Compared");
-        }
-    }
-
+    
     #[test]
-    fn transprojection() {
-        let mut result = ResultBody::<f64>::new(1e-12_f64);
-        let start = Instant::now();
-        let standard = start.elapsed();
-
-        result.add_tuple_2(
-            (0000_f64, 0000_f64),
-            latlon_to_azimnth_isometric(0000_f64, 0000_f64),
-        );
-        result.add_tuple_2(
-            (0000_f64, -090_f64),
-            latlon_to_azimnth_isometric(-090_f64, 0000_f64),
-        );
-        result.add_tuple_2(
-            (0000_f64, 0135_f64),
-            latlon_to_azimnth_isometric(0045_f64, 0180_f64),
-        );
-        result.add_tuple_2(
-            (0000_f64, 0050_f64),
-            latlon_to_azimnth_isometric(0050_f64, 0000_f64),
-        );
-
-        let end_ltai = start.elapsed();
-
-        result.add_tuple_2_vec(
-            (
-                vec![
-                    0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64, 0000_f64,
-                    0000_f64, 0000_f64, 0000_f64, 0000_f64,
-                ],
-                vec![
-                    0020_f64, -020_f64, 0160_f64, -160_f64, 0050_f64, -050_f64, 0130_f64, -130_f64,
-                    0080_f64, -080_f64, 0100_f64, -100_f64,
-                ],
-            ),
-            latlon_to_azimnth_isometric_simd(
-                vec![
-                    0020_f64, -020_f64, 0020_f64, -020_f64, 0050_f64, -050_f64, 0050_f64, -050_f64,
-                    0080_f64, -080_f64, 0080_f64, -080_f64,
-                ],
-                vec![
-                    0000_f64, 0000_f64, 0180_f64, 0180_f64, 0000_f64, 0000_f64, 0180_f64, 0180_f64,
-                    0000_f64, 0000_f64, 0180_f64, 0180_f64,
-                ],
-            ),
-        );
-
-        let end_ltais = start.elapsed();
-
-        assert_eq!(
-            is_clockwise(
-                &vec![1_f64, -1_f64, -1_f64, 1_f64],
-                &vec![1_f64, 1_f64, -1_f64, -1_f64]
-            ),
-            false
-        );
-
+    fn test_main() {
         let buffer: Vec<u8> = fs::read("./shapefile/ne_110m_land.shp").expect("IO Error");
-        let parameter = GenerateParameters {
+        let latlon_parameter = GenerateParameters {
             color_point: 0x0000FFu32,
             color_multipoint: 0x0000FFu32,
             color_line: 0xFFFFFFFFu32,
@@ -746,17 +558,27 @@ mod tests {
             width_multipoint: 3_i32,
             width_line: 2_i32,
             fineness: 0x00u8,
-            radius: 500u32,
-            base_latitude: 0000f64,
-            base_longitude: 0000f64,
+            radius: 200u32,
+            base_lat: 0090f64,
+            base_lon: 0010f64,
+        };
+        let map_parameter = GenerateParameters {
+            color_point: 0x0000FFu32,
+            color_multipoint: 0x0000FFu32,
+            color_line: 0xFFFFFFFFu32,
+            color_polygon: 0xF2E6C2FFu32,
+            width_point: 3_i32,
+            width_multipoint: 3_i32,
+            width_line: 2_i32,
+            fineness: 0x00u8,
+            radius: 200u32,
+            base_lat: 0090f64,
+            base_lon: 0000f64,
         };
 
         let mut out_file = File::create("./out/image.png").unwrap();
-        let out_buffer = shapefile_generate(&buffer, parameter).expect("Shapefile Error");
+        let out_buffer = shapefile_generate(&buffer, map_parameter).expect("Shapefile Error");
+        //let out_buffer = latlon_line_draw(latlon_parameter, 0, 0);
         let _ = out_file.write_all(&out_buffer);
-
-        result.compare();
-
-        dbg!(standard, end_ltai, end_ltais);
     }
 }

@@ -49,6 +49,7 @@ dependencies = [
  "approx",
  "image",
  "imageproc",
+ "libm",
  "rayon",
  "shapefile",
  "wide 1.0.2",
