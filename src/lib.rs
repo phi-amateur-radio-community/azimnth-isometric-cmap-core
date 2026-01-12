@@ -16,6 +16,11 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::mem::ManuallyDrop;
 
+const CHUNKS_SIZE: usize = 4096;
+const INSERT_LIMIT: isize = 256;
+const INSERT_THRESHOLD: f64 = 0.1;
+const INSERT_DENSITY: f64 = 0.01;
+
 const DEGREE_TO_RADIAN_CONSTANT: f64 = std::f64::consts::PI / 180_f64;
 const RADIAN_TO_DEGREE_CONSTANT: f64 = 180_f64 / std::f64::consts::PI;
 const PI: f64 = std::f64::consts::PI;
@@ -39,11 +44,11 @@ pub extern "C" fn latlon_to_azimnth_isometric_csupport(
     lat_base: f64,
     lon_delta: f64,
 ) -> LatlonToAzimnthIsometricCsupport {
-    let (x, y): (f64, f64) = latlon_to_azimnth_isometric(lat, lon_delta, lat_base);
+    let (x, y, _): (f64, f64, f64) = latlon_to_azimnth_isometric(lat, lon_delta, lat_base);
     LatlonToAzimnthIsometricCsupport { x, y }
 }
 
-pub fn latlon_to_azimnth_isometric(lat: f64, lon_delta: f64, lat_base: f64) -> (f64, f64) {
+pub fn latlon_to_azimnth_isometric(lat: f64, lon_delta: f64, lat_base: f64) -> (f64, f64, f64) {
     let square = |x: f64| x * x;
     let square_overflow = |x: f64| square(x).clamp(-1f64, 1f64);
     let lat_rad = lat * DEGREE_TO_RADIAN_CONSTANT;
@@ -58,7 +63,7 @@ pub fn latlon_to_azimnth_isometric(lat: f64, lon_delta: f64, lat_base: f64) -> (
     let (angle_delta_sin, angle_delta_cos) = angle_delta.sin_cos();
     let x = angle_delta_cos * p_distance;
     if x.abs() == 1f64 {
-        return (0f64, 0f64);
+        return (0f64, 0f64, x);
     }
     let y = angle_delta_sin * p_distance;
     let distance = x.acos();
@@ -68,23 +73,7 @@ pub fn latlon_to_azimnth_isometric(lat: f64, lon_delta: f64, lat_base: f64) -> (
     } else {
         -(1f64 - square_overflow(angle_cos)).sqrt()
     };
-
-    println!(
-        "x:{}, y:{}, lat:{}, lon:{}, p_x:{}, p_y:{}, p_angle:{}, p_distance:{}, distance:{}, angle_sin:{}, angle_cos:{}",
-        angle_sin * distance * 200f64 / PI,
-        angle_cos * distance * 200f64 / PI,
-        lat,
-        lon_delta,
-        p_x,
-        p_y,
-        p_angle,
-        p_distance,
-        distance,
-        angle_sin,
-        angle_cos
-    );
-
-    (angle_sin * distance, -angle_cos * distance)
+    (angle_sin * distance, -angle_cos * distance, x)
 }
 
 #[derive(Copy, Clone)]
@@ -99,34 +88,123 @@ impl Point {
     }
 }
 
-const CHUNKS_SIZE: usize = 4096;
 fn latlon_to_azimnth_isometric_array(
     points: Vec<Point>,
     lat_base: f64,
     lon_base: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     let points_len = points.len();
-    points
+    let (xs, ys, ks): (Vec<f64>, Vec<f64>, Vec<f64>) = points
         .par_chunks(CHUNKS_SIZE)
         .map(|chunk| {
             chunk
                 .iter()
                 .map(|point| latlon_to_azimnth_isometric(point.y, point.x - lon_base, lat_base))
-                .unzip()
+                .fold(
+                    (
+                        Vec::with_capacity(chunk.len()),
+                        Vec::with_capacity(chunk.len()),
+                        Vec::with_capacity(chunk.len()),
+                    ),
+                    |(mut xs, mut ys, mut ks), (x, y, k)| {
+                        xs.push(x);
+                        ys.push(y);
+                        ks.push(k);
+                        (xs, ys, ks)
+                    },
+                )
         })
         .reduce(
             || {
                 (
                     Vec::with_capacity(points_len),
                     Vec::with_capacity(points_len),
+                    Vec::with_capacity(points_len),
                 )
             },
-            |(mut xs1, mut ys1), (xs2, ys2)| {
+            |(mut xs1, mut ys1, mut ks1), (xs2, ys2, ks2)| {
                 xs1.extend(xs2);
                 ys1.extend(ys2);
-                (xs1, ys1)
+                ks1.extend(ks2);
+                (xs1, ys1, ks1)
             },
-        )
+        );
+    let mut add_sum: isize = 0;
+    let add_map: Vec<isize> = ks
+        .into_iter()
+        .map(|k| {
+            let distance = 1f64 + k;
+            if distance < INSERT_THRESHOLD {
+                if k == -1f64 {
+                    add_sum -= 1;
+                    return -1isize;
+                }
+                let n = ((INSERT_DENSITY / distance).ceil() as isize).clamp(0isize, INSERT_LIMIT);
+                add_sum += n;
+                n
+            } else {
+                0isize
+            }
+        })
+        .collect();
+
+    let len_added = ((add_map.len() as isize) + (add_sum * 2isize)) as usize;
+    let mut xs_added: Vec<f64> = Vec::with_capacity(len_added);
+    let mut ys_added: Vec<f64> = Vec::with_capacity(len_added);
+    let mut last_point = Point { x: 0f64, y: 0f64 };
+    let mut k_cache = 0;
+    for (index, k) in add_map.iter().enumerate() {
+        if *k == -1isize {
+            continue;
+        }
+        let x = xs[index];
+        let y = ys[index];
+        let point = points[index];
+        k_cache += *k;
+        if (index != 0) && (k_cache != 0) {
+            let delta_x = point.x - last_point.x;
+            let delta_x = if delta_x > 180f64 {
+                360f64 - delta_x
+            } else if delta_x < -180f64 {
+                360f64 + delta_x
+            } else {
+                delta_x
+            };
+            let t_x = delta_x / ((k_cache + 1) as f64);
+            let t_y = (point.y - last_point.y) / ((k_cache + 1) as f64);
+            let last_lon_delta = last_point.x - lon_base;
+            for i in 1..k_cache {
+                let (x_add, y_add, _) = latlon_to_azimnth_isometric(
+                    last_point.y + (t_y * i as f64),
+                    last_lon_delta + (t_x * i as f64),
+                    lat_base,
+                );
+                xs_added.push(x_add);
+                ys_added.push(y_add);
+            }
+        }
+        last_point = point;
+        xs_added.push(x);
+        ys_added.push(y);
+        k_cache = *k;
+    }
+    k_cache += add_map[0];
+    let point = points[0];
+    if k_cache != 0 {
+        let t_x = (point.x - last_point.x) / ((k_cache + 1) as f64);
+        let t_y = (point.y - last_point.y) / ((k_cache + 1) as f64);
+        let last_lon_delta = last_point.x - lon_base;
+        for i in 1..k_cache {
+            let (x_add, y_add, _) = latlon_to_azimnth_isometric(
+                last_point.y + (t_y * i as f64),
+                last_lon_delta + (t_x * i as f64),
+                lat_base,
+            );
+            xs_added.push(x_add);
+            ys_added.push(y_add);
+        }
+    }
+    (xs_added, ys_added)
 }
 
 #[repr(C)]
@@ -398,7 +476,7 @@ fn shapefile_draw_point<T: HasXY>(
     point: T,
     r: i32,
 ) {
-    let (x, y) = latlon_to_azimnth_isometric(point.y(), point.x() - base_lon, base_lat);
+    let (x, y, _) = latlon_to_azimnth_isometric(point.y(), point.x() - base_lon, base_lat);
     let x = (x * ltc).round() as i32 + r;
     let y = (y * ltc).round() as i32 + r;
     draw_filled_circle_mut(img, (x, y), width, get_color_rgba(color));
@@ -488,7 +566,6 @@ fn shapefile_draw_polygon<T: HasXY>(
             .map(|(x_origin, y_origin)| {
                 let x = (x_origin * ltc).round() as i32 + r;
                 let y = (y_origin * ltc).round() as i32 + r;
-
                 let point = (x, y);
                 if point_set.contains(&point) {
                     return None;
@@ -603,7 +680,7 @@ mod tests {
             fineness: 0x00u8,
             radius: 200u32,
             base_lat: 0090f64,
-            base_lon: 0010f64,
+            base_lon: 0000f64,
         };
         let map_parameter = GenerateParameters {
             color_point: 0x0000FFu32,
